@@ -1,0 +1,297 @@
+name: Docker
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*-umbrel.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            local key="$1"
+            local -a values
+            mapfile -t values < <(sed -n "s/^${key}=//p" versions.env)
+
+            if [ "${#values[@]}" -ne 1 ] || [[ ! "${values[0]}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "versions.env must contain exactly one safe ${key}=value entry" >&2
+              exit 1
+            fi
+
+            printf '%s' "${values[0]}"
+          }
+
+          CLN_VERSION="$(read_version CLN_VERSION)"
+          BITCOIN_VERSION="$(read_version BITCOIN_VERSION)"
+          IMAGE_VERSION="$(read_version IMAGE_VERSION)"
+
+          [[ "${CLN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${BITCOIN_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]
+          [[ "${IMAGE_VERSION}" =~ ^v${CLN_VERSION//./\.}-umbrel\.[1-9][0-9]*$ ]]
+
+          {
+            printf 'CLN_VERSION=%s\n' "${CLN_VERSION}"
+            printf 'BITCOIN_VERSION=%s\n' "${BITCOIN_VERSION}"
+            printf 'IMAGE_VERSION=%s\n' "${IMAGE_VERSION}"
+            printf 'BUILD_VCS_REF=%s\n' "$(git rev-parse HEAD)"
+          } >>"${GITHUB_ENV}"
+
+      - name: Build image natively
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          docker build \
+            --platform "${PLATFORM}" \
+            --build-arg "CLN_VERSION=${CLN_VERSION}" \
+            --build-arg "BITCOIN_VERSION=${BITCOIN_VERSION}" \
+            --build-arg "VCS_REF=${BUILD_VCS_REF}" \
+            --tag "core-lightning-test:${SUFFIX}" \
+            .
+
+      - name: Smoke test image
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          image="core-lightning-test:${SUFFIX}"
+
+          test "$(docker run --rm --entrypoint lightningd "${image}" --version)" = "v${CLN_VERSION}"
+          test "$(docker run --rm --entrypoint lightning-cli "${image}" --version)" = "v${CLN_VERSION}"
+          docker run --rm --entrypoint bitcoin-cli "${image}" --version | grep -F "v${BITCOIN_VERSION}.0"
+
+          docker run --rm --entrypoint /bin/bash "${image}" -euo pipefail -c '
+            test -x /usr/bin/lightningd
+            test -x /usr/libexec/c-lightning/plugins/commando
+            test -L /usr/local/bin/lightningd
+            test -L /usr/local/libexec/c-lightning
+
+            while IFS= read -r binary; do
+              linked_libraries="$(ldd "${binary}" 2>&1 || true)"
+              if grep -F "not found" <<<"${linked_libraries}"; then
+                echo "Missing shared library required by ${binary}" >&2
+                exit 1
+              fi
+            done < <(find /usr/bin /usr/libexec/c-lightning -type f -perm /111)
+          '
+
+      - name: Export tested image
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+        run: docker image save --output "/tmp/core-lightning-${SUFFIX}.tar" "core-lightning-test:${SUFFIX}"
+
+      - name: Upload tested image
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tested-image-${{ matrix.suffix }}
+          path: /tmp/core-lightning-${{ matrix.suffix }}.tar
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    name: Publish multi-architecture image
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: docker-publish-${{ github.ref }}
+      cancel-in-progress: false
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            local key="$1"
+            local -a values
+            mapfile -t values < <(sed -n "s/^${key}=//p" versions.env)
+
+            if [ "${#values[@]}" -ne 1 ] || [[ ! "${values[0]}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "versions.env must contain exactly one safe ${key}=value entry" >&2
+              exit 1
+            fi
+
+            printf '%s' "${values[0]}"
+          }
+
+          CLN_VERSION="$(read_version CLN_VERSION)"
+          BITCOIN_VERSION="$(read_version BITCOIN_VERSION)"
+          IMAGE_VERSION="$(read_version IMAGE_VERSION)"
+
+          [[ "${CLN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${BITCOIN_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]
+          [[ "${IMAGE_VERSION}" =~ ^v${CLN_VERSION//./\.}-umbrel\.[1-9][0-9]*$ ]]
+
+          if [ "${GITHUB_REF_NAME}" != "${IMAGE_VERSION}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match IMAGE_VERSION=${IMAGE_VERSION}" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin '+refs/heads/master:refs/remotes/origin/master'
+          tag_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor "${tag_commit}" origin/master; then
+            echo "Release tag must point to a commit already contained in master" >&2
+            exit 1
+          fi
+
+          {
+            printf 'CLN_VERSION=%s\n' "${CLN_VERSION}"
+            printf 'BITCOIN_VERSION=%s\n' "${BITCOIN_VERSION}"
+            printf 'IMAGE_VERSION=%s\n' "${IMAGE_VERSION}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Download tested images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tested-image-*
+          path: /tmp/core-lightning-images
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tested architecture images
+        run: |
+          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          for arch in amd64 arm64; do
+            docker image load --input "/tmp/core-lightning-images/core-lightning-${arch}.tar"
+            staging_image="${image_repository}:build-${GITHUB_SHA}-${arch}"
+            docker image tag "core-lightning-test:${arch}" "${staging_image}"
+            push_output="$(docker image push "${staging_image}" 2>&1)"
+            echo "${push_output}"
+
+            digest="$(awk '{
+              for (field = 1; field <= NF; field++) {
+                if ($field == "digest:") {
+                  print $(field + 1)
+                }
+              }
+            }' <<<"${push_output}")"
+            reference="${image_repository}@${digest}"
+            if [[ ! "${reference}" =~ ^${image_repository}@sha256:[0-9a-f]{64}$ ]]; then
+              echo "Could not determine pushed digest for ${staging_image}: ${reference}" >&2
+              exit 1
+            fi
+
+            printf '%s_REFERENCE=%s\n' "${arch^^}" "${reference}" >>"${GITHUB_ENV}"
+          done
+
+      - name: Require anonymous access before release
+        run: |
+          docker logout ghcr.io
+
+          if ! docker buildx imagetools inspect "${AMD64_REFERENCE}" >/dev/null || \
+             ! docker buildx imagetools inspect "${ARM64_REFERENCE}" >/dev/null; then
+            echo "The GHCR package is not publicly readable." >&2
+            echo "Set the package visibility to public, then rerun this publish job." >&2
+            exit 1
+          fi
+
+      - name: Log back in to GitHub Container Registry
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested images as one manifest
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${IMAGE_VERSION}"
+
+          set +e
+          inspect_output="$(docker buildx imagetools inspect "${image}" 2>&1)"
+          inspect_status=$?
+          set -e
+          if [ "${inspect_status}" -eq 0 ]; then
+            echo "Refusing to overwrite existing image tag ${image}" >&2
+            exit 1
+          fi
+          if ! grep -Eqi '(manifest unknown|not found)' <<<"${inspect_output}"; then
+            echo "Could not safely establish that ${image} is unused:" >&2
+            echo "${inspect_output}" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            --tag "${image}" \
+            "${AMD64_REFERENCE}" \
+            "${ARM64_REFERENCE}"
+
+          amd64_digest="${AMD64_REFERENCE##*@}"
+          arm64_digest="${ARM64_REFERENCE##*@}"
+          docker buildx imagetools inspect --raw "${image}" | jq -e \
+            --arg amd64 "${amd64_digest}" \
+            --arg arm64 "${arm64_digest}" '
+              ((.manifests | length) == 2) and
+              (
+                .manifests
+                | map(select(.platform.os == "linux") | {
+                    key: .platform.architecture,
+                    value: .digest
+                  })
+                | from_entries
+                | . == {amd64: $amd64, arm64: $arm64}
+              )
+            '
+
+      - name: Verify public release
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${IMAGE_VERSION}"
+          docker logout ghcr.io
+          docker buildx imagetools inspect "${image}"
+          docker pull --platform linux/amd64 "${image}"
+          docker pull --platform linux/arm64 "${image}"
+
+          manifest_digest="$(docker buildx imagetools inspect "${image}" | awk '$1 == "Digest:" { print $2; exit }')"
+          [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo '### Published image'
+            echo
+            echo "\`${image}@${manifest_digest}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
